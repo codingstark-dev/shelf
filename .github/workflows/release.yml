@@ -1,0 +1,100 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  dmg:
+    runs-on: macos-latest
+    # Secrets are scoped to the steps that use them, never the job: third-party actions and
+    # crate build scripts run in this job too.
+    steps:
+      - uses: actions/checkout@v4
+
+      # `secrets` can't be used in step `if:`, so publish only whether they are set.
+      - name: Detect signing secrets
+        id: has
+        env:
+          P12: ${{ secrets.APPLE_CERT_P12 }}
+          TEAM: ${{ secrets.APPLE_TEAM_ID }}
+          AID: ${{ secrets.APPLE_ID }}
+          APW: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          [ -n "$P12" ] && [ -n "$TEAM" ] && echo "sign=true" >> "$GITHUB_OUTPUT" || true
+          [ -n "$AID" ] && [ -n "$APW" ] && echo "notarize=true" >> "$GITHUB_OUTPUT" || true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build both arches
+        env:
+          # Optional: enables "Sign in with Cloudflare" in the built app.
+          SHELF_CF_CLIENT_ID: ${{ secrets.SHELF_CF_CLIENT_ID }}
+          SHELF_CF_SCOPES: ${{ vars.SHELF_CF_SCOPES }}
+        run: |
+          # Unset-but-empty would override the built-in defaults, so drop empties.
+          [ -n "$SHELF_CF_CLIENT_ID" ] || unset SHELF_CF_CLIENT_ID
+          [ -n "$SHELF_CF_SCOPES" ] || unset SHELF_CF_SCOPES
+          for t in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release -p shelf --target $t
+          done
+          mkdir -p dist
+          lipo -create -output dist/shelf \
+            target/aarch64-apple-darwin/release/shelf target/x86_64-apple-darwin/release/shelf
+
+      - name: Bundle Shelf.app
+        run: scripts/bundle.sh "${GITHUB_REF_NAME#v}" dist/shelf dist
+
+      - name: Codesign app
+        if: steps.has.outputs.sign == 'true'
+        env:
+          APPLE_CERT_P12: ${{ secrets.APPLE_CERT_P12 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          echo "$APPLE_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p ci "$RUNNER_TEMP/ci.keychain"
+          security set-keychain-settings -lut 3600 "$RUNNER_TEMP/ci.keychain"
+          security unlock-keychain -p ci "$RUNNER_TEMP/ci.keychain"
+          security import "$RUNNER_TEMP/cert.p12" -P "$APPLE_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$RUNNER_TEMP/ci.keychain"
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k ci "$RUNNER_TEMP/ci.keychain"
+          security list-keychains -d user -s "$RUNNER_TEMP/ci.keychain" login.keychain
+          IDENTITY=$(security find-identity -v -p codesigning "$RUNNER_TEMP/ci.keychain" | grep "($APPLE_TEAM_ID)" | head -1 | sed -E 's/.*"(.*)".*/\1/')
+          codesign --force --options runtime --timestamp --sign "$IDENTITY" dist/Shelf.app
+          echo "SIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+
+      - name: Create dmg
+        run: |
+          mkdir stage && cp -R dist/Shelf.app stage/ && ln -s /Applications stage/Applications
+          hdiutil create -volname Shelf -srcfolder stage -ov -format UDZO "Shelf-${GITHUB_REF_NAME}.dmg"
+
+      - name: Notarize and staple
+        if: env.SIGN_IDENTITY != '' && steps.has.outputs.notarize == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          codesign --force --timestamp --sign "$SIGN_IDENTITY" "Shelf-${GITHUB_REF_NAME}.dmg"
+          xcrun notarytool submit "Shelf-${GITHUB_REF_NAME}.dmg" \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
+          xcrun stapler staple "Shelf-${GITHUB_REF_NAME}.dmg"
+
+      - name: Zip for npx shelf-drive
+        run: |
+          (cd dist && ditto -c -k --keepParent Shelf.app ../Shelf-macos-universal.zip)
+          shasum -a 256 Shelf-macos-universal.zip | cut -d' ' -f1 > Shelf-macos-universal.zip.sha256
+
+      - name: Attach to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            Shelf-*.dmg
+            Shelf-macos-universal.zip
+            Shelf-macos-universal.zip.sha256
+          generate_release_notes: true
